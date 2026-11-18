@@ -29,9 +29,11 @@ Add the package to `plugins` in `~/.config/opencode/cli.json`:
 
 ```json
 {
-  "plugins": ["opencode-claude-usage"]
+  "plugins": ["@sharath_huddar/opencode-claude-usage"]
 }
 ```
+
+OpenCode installs the package from npm and reloads plugins automatically.
 
 For a local checkout, use the path instead:
 
@@ -47,7 +49,7 @@ For a local checkout, use the path instead:
 {
   "plugins": [
     {
-      "package": "opencode-claude-usage",
+      "package": "@sharath_huddar/opencode-claude-usage",
       "options": { "providers": ["claude-agent"], "intervalSeconds": 300, "warnAt": 75, "criticalAt": 90 }
     }
   ]
