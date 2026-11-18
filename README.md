@@ -102,9 +102,11 @@ The stored data is the parsed usage numbers and request timestamps only, never t
 ```sh
 npm install
 npm run typecheck
+npm run build   # compiles src/tui.tsx to dist/tui.js (Bun is a dev dependency)
 ```
 
-Point `cli.json` at your checkout. OpenCode reloads plugins when config changes.
+Point `cli.json` at your checkout and rebuild after changes. The package exports the compiled `dist/tui.js`:
+OpenCode's runtime JSX transform skips files under `node_modules`, so npm-installed plugins must ship compiled JSX.
 
 ## License
 
