@@ -23,7 +23,8 @@ export default Plugin.define({
   setup(context) {
     const options = readOptions(context.options)
 
-    return createRoot((dispose) => {
+    // Plugin-owned reactive state (signals, memo, polling effect). No host UI APIs are called in here.
+    const state = createRoot((dispose) => {
       const [result, setResult] = createSignal<UsageResult | undefined>()
       const [loading, setLoading] = createSignal(false)
       const [now, setNow] = createSignal(Date.now())
@@ -83,58 +84,66 @@ export default Plugin.define({
         afterTurn = setTimeout(() => void refresh(), AFTER_TURN_DELAY_MS)
       })
 
-      const state = { result, loading, lastError, now, options }
-
-      const stopSidebar = context.ui.slot({
-        append: "sidebar.content",
-        render: () => (
-          <Show when={active()}>
-            <Sidebar {...state} />
-          </Show>
-        ),
-      })
-
-      const stopFooter = context.ui.slot({
-        append: "prompt.footer.status",
-        render: () => (
-          <Show when={active()}>
-            <Footer {...state} />
-          </Show>
-        ),
-      })
-
-      context.keymap.layer(() => ({
-        mode: "global",
-        commands: [
-          {
-            id: "claude-usage.show",
-            title: "Claude plan usage",
-            group: "Claude usage",
-            palette: true,
-            slash: { name: "claude-usage" },
-            run: async () => {
-              if (!active()) {
-                await context.ui.dialog.alert({
-                  title: "Claude plan usage",
-                  message: `Not active: the selected model isn't from ${options.providers.join(", ")}.`,
-                })
-                return
-              }
-              await refresh(true)
-              await context.ui.dialog.alert({ title: "Claude plan usage", message: describe(result(), lastError()) })
-            },
-          },
-        ],
-      }))
-
-      return () => {
+      const view: ViewProps = { result, loading, lastError, now, options }
+      const cleanup = () => {
         clearTimeout(afterTurn)
         stopEvents()
-        stopSidebar()
-        stopFooter()
         dispose()
       }
+      return { active, refresh, view, details: () => describe(result(), lastError()), cleanup }
     })
+
+    // UI registration happens outside the plugin's own Solid root. keymap.layer builds its layer under the
+    // current owner when there is one, and only the host's owner provides the keymap context; calling it
+    // inside createRoot fails with "Keymap.Provider is missing".
+    const stopSidebar = context.ui.slot({
+      append: "sidebar.content",
+      render: () => (
+        <Show when={state.active()}>
+          <Sidebar {...state.view} />
+        </Show>
+      ),
+    })
+
+    const stopFooter = context.ui.slot({
+      append: "prompt.footer.status",
+      render: () => (
+        <Show when={state.active()}>
+          <Footer {...state.view} />
+        </Show>
+      ),
+    })
+
+    context.keymap.layer(() => ({
+      mode: "global",
+      commands: [
+        {
+          id: "claude-usage.show",
+          title: "Claude plan usage",
+          group: "Claude usage",
+          palette: true,
+          slash: { name: "claude-usage" },
+          run: async () => {
+            if (!state.active()) {
+              await context.ui.dialog.alert({
+                title: "Claude plan usage",
+                message: `Not active: the selected model isn't from ${options.providers.join(", ")}.`,
+              })
+              return
+            }
+            await state.refresh(true)
+            await context.ui.dialog.alert({ title: "Claude plan usage", message: state.details() })
+          },
+        },
+      ],
+    }))
+
+    // The host removes the keymap layer itself when the plugin is disabled or reloaded.
+    return () => {
+      stopSidebar()
+      stopFooter()
+      state.cleanup()
+    }
   },
 })
 
