@@ -29,6 +29,8 @@ export default Plugin.define({
       const [loading, setLoading] = createSignal(false)
       const [now, setNow] = createSignal(Date.now())
       const [lastError, setLastError] = createSignal<string | undefined>()
+      // Number of mounted sidebar slots. The host mounts sidebar.content only while the sidebar is visible.
+      const [sidebarMounts, setSidebarMounts] = createSignal(0)
 
       const active = createMemo(() => {
         const providerID = context.ui.model.current()?.providerID
@@ -90,7 +92,16 @@ export default Plugin.define({
         stopEvents()
         dispose()
       }
-      return { active, refresh, view, details: () => describe(result(), lastError()), cleanup }
+      return {
+        active,
+        refresh,
+        view,
+        details: () => describe(result(), lastError()),
+        sidebarVisible: () => sidebarMounts() > 0,
+        sidebarMounted: () => setSidebarMounts((n) => n + 1),
+        sidebarUnmounted: () => setSidebarMounts((n) => Math.max(0, n - 1)),
+        cleanup,
+      }
     })
 
     // UI registration happens outside the plugin's own Solid root. keymap.layer builds its layer under the
@@ -98,17 +109,28 @@ export default Plugin.define({
     // inside createRoot fails with "Keymap.Provider is missing".
     const stopSidebar = context.ui.slot({
       append: "sidebar.content",
-      render: () => (
-        <Show when={state.active()}>
-          <Sidebar {...state.view} />
-        </Show>
-      ),
+      render: () => {
+        const Presence = () => {
+          state.sidebarMounted()
+          onCleanup(state.sidebarUnmounted)
+          return null
+        }
+        return (
+          <>
+            <Presence />
+            <Show when={state.active()}>
+              <Sidebar {...state.view} />
+            </Show>
+          </>
+        )
+      },
     })
 
+    // The footer duplicates the sidebar, so it only shows while the sidebar is hidden (or on the home screen).
     const stopFooter = context.ui.slot({
       append: "prompt.footer.status",
       render: () => (
-        <Show when={state.active()}>
+        <Show when={state.active() && !state.sidebarVisible()}>
           <Footer {...state.view} />
         </Show>
       ),

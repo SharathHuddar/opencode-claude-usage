@@ -64,7 +64,8 @@ For a local checkout, use the path instead:
 ## Usage
 
 - **Sidebar:** one row per usage window (bar, %, time to reset), plus extra-usage status.
-- **Prompt footer:** compact `5h 37% 7d 34%`.
+- **Prompt footer:** compact `5h 37% 7d 34%`, shown only while the sidebar is hidden (narrow terminal, sidebar toggled
+  off, or the home screen).
 - **`/claude-usage`** (also in the command palette): refresh now and show details.
 
 It refreshes every `intervalSeconds`, plus a few seconds after each completed turn (at most once every 15 s).
