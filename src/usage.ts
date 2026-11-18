@@ -22,7 +22,8 @@ export interface UsageWindow {
   readonly label: string
   /** 0-100 */
   readonly utilization: number
-  readonly resetsAt: Date
+  /** Epoch ms. */
+  readonly resetsAt: number
 }
 
 export interface ExtraUsage {
@@ -38,10 +39,11 @@ export type UsageResult =
       readonly status: "ok"
       readonly windows: readonly UsageWindow[]
       readonly extra: ExtraUsage | null
-      readonly fetchedAt: Date
+      /** Epoch ms. */
+      readonly fetchedAt: number
     }
   | { readonly status: "stale"; readonly message: string }
-  | { readonly status: "rate_limited"; readonly message: string; readonly retryAfterMs: number }
+  | { readonly status: "rate_limited"; readonly message: string; readonly retryAfterMs?: number }
   | { readonly status: "error"; readonly message: string }
 
 /** Thrown when the endpoint's response no longer matches what we expect. */
@@ -66,7 +68,7 @@ const WINDOWS: ReadonlyArray<{ key: string; label: string; required: boolean }> 
  * The single place that interprets the endpoint's response.
  * Throws UsageSchemaError when required fields are missing or mistyped.
  */
-export function parseUsage(body: unknown, now = new Date()): Extract<UsageResult, { status: "ok" }> {
+export function parseUsage(body: unknown, now = Date.now()): Extract<UsageResult, { status: "ok" }> {
   const problems: string[] = []
   if (!isRecord(body)) throw new UsageSchemaError(["response is not a JSON object"])
 
@@ -82,12 +84,12 @@ export function parseUsage(body: unknown, now = new Date()): Extract<UsageResult
       continue
     }
     const utilization = raw.utilization
-    const resetsAt = typeof raw.resets_at === "string" ? new Date(raw.resets_at) : undefined
+    const resetsAt = typeof raw.resets_at === "string" ? Date.parse(raw.resets_at) : Number.NaN
     if (typeof utilization !== "number" || !Number.isFinite(utilization)) {
       problems.push(`${spec.key}.utilization is not a number`)
       continue
     }
-    if (!resetsAt || Number.isNaN(resetsAt.getTime())) {
+    if (Number.isNaN(resetsAt)) {
       problems.push(`${spec.key}.resets_at is not an ISO timestamp`)
       continue
     }
@@ -155,7 +157,7 @@ export async function fetchUsage(): Promise<UsageResult> {
     return {
       status: "rate_limited",
       message: "rate limited by usage endpoint",
-      retryAfterMs: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 5 * 60_000,
+      retryAfterMs: Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined,
     }
   }
   if (!response.ok) {

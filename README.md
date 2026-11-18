@@ -48,7 +48,7 @@ For a local checkout, use the path instead:
   "plugins": [
     {
       "package": "opencode-claude-usage",
-      "options": { "providers": ["claude-agent"], "intervalSeconds": 120, "warnAt": 75, "criticalAt": 90 }
+      "options": { "providers": ["claude-agent"], "intervalSeconds": 300, "warnAt": 75, "criticalAt": 90 }
     }
   ]
 }
@@ -57,7 +57,7 @@ For a local checkout, use the path instead:
 | Option            | Default            | Meaning                                                      |
 | ----------------- | ------------------ | ------------------------------------------------------------ |
 | `providers`       | `["claude-agent"]` | Provider IDs whose models bill against your Claude plan       |
-| `intervalSeconds` | `120` (min `60`)   | Polling interval while active                                 |
+| `intervalSeconds` | `300` (min `60`)   | How often to refresh while active                             |
 | `warnAt`          | `75`               | % at which a window turns the theme's warning colour          |
 | `criticalAt`      | `90`               | % at which a window turns the theme's error colour            |
 
@@ -68,13 +68,25 @@ For a local checkout, use the path instead:
   off, or the home screen).
 - **`/claude-usage`** (also in the command palette): refresh now and show details.
 
-It refreshes every `intervalSeconds`, plus a few seconds after each completed turn (at most once every 15 s).
+## Refreshing and rate limits
+
+The usage endpoint is rate limited (HTTP 429), so the plugin keeps requests to a minimum:
+
+- The last result is stored in OpenCode's plugin storage and shared by every TUI window and plugin reload. A new
+  window or a reload shows the stored numbers and only fetches if they are older than `intervalSeconds`.
+- While active, it refreshes every `intervalSeconds`, and a few seconds after a completed turn, at most once a minute.
+  These limits are shared across all windows.
+- `/claude-usage` uses the same once-a-minute limit, then shows the latest numbers.
+- On a 429 every window waits for `Retry-After` (at least 60 s), doubling on each consecutive 429 up to 15 minutes.
+  The last good numbers stay visible with `rate limited · retry HH:MM`.
+
+The stored data is the parsed usage numbers and request timestamps only, never the token.
 
 ## How it works and security
 
 - On every fetch, it reads the `Claude Code-credentials` item from the macOS keychain, takes the OAuth access token, and
   calls `GET https://api.anthropic.com/api/oauth/usage`.
-- The token is sent only to `api.anthropic.com`. It is never written to disk, logged, cached, or shown.
+- The token is sent only to `api.anthropic.com`. It is never written to disk, logged, stored, or shown.
 - **It never refreshes the OAuth token.** Refreshing rotates the stored refresh token and can sign Claude Code out. If
   the token has expired, the plugin shows `stale — token refreshes on next Claude use`; Claude Code refreshes it the
   next time a Claude model is used.

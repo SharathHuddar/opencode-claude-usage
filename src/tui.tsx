@@ -1,11 +1,11 @@
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
 import { For, Show, createEffect, createMemo, createRoot, createSignal, on, onCleanup } from "solid-js"
-import { fetchUsage, type UsageResult, type UsageWindow } from "./usage.ts"
+import { fetchUsage, type ExtraUsage, type UsageWindow } from "./usage.ts"
 
 interface Options {
   /** Provider IDs that bill against the Claude plan. */
   readonly providers: readonly string[]
-  /** Polling interval while a matching model is selected. Minimum 60. */
+  /** How often to refresh while a matching model is selected. Minimum 60. */
   readonly intervalSeconds: number
   /** Utilization (%) at which a window turns the warning colour. */
   readonly warnAt: number
@@ -13,22 +13,59 @@ interface Options {
   readonly criticalAt: number
 }
 
-const DEFAULTS: Options = { providers: ["claude-agent"], intervalSeconds: 120, warnAt: 75, criticalAt: 90 }
+const DEFAULTS: Options = { providers: ["claude-agent"], intervalSeconds: 300, warnAt: 75, criticalAt: 90 }
+/** How often each instance checks whether a refresh is due (and updates relative times). */
+const TICK_MS = 30_000
+/** Slack so instances whose ticks drift slightly still refresh once per interval. */
+const TICK_SLACK_MS = 5_000
 const AFTER_TURN_DELAY_MS = 3_000
-const MIN_GAP_MS = 15_000
-const BAR_WIDTH = 10
+/** Minimum gap between requests triggered by turns or /claude-usage, shared across all instances. */
+const ON_DEMAND_GAP_MS = 60_000
+/** Base wait after a 429 without Retry-After, and the floor when it has one. */
+const RATE_LIMIT_BASE_MS = 60_000
+const RATE_LIMIT_MAX_MS = 15 * 60_000
+
+interface Snapshot {
+  readonly windows: UsageWindow[]
+  readonly extra: ExtraUsage | null
+  readonly fetchedAt: number
+}
+
+interface Failure {
+  readonly status: "stale" | "error" | "rate_limited"
+  readonly message: string
+  readonly at: number
+}
+
+/**
+ * Persisted plugin storage, shared by every TUI instance and plugin reload. Holds only the normalized usage
+ * snapshot and request bookkeeping: never the token or raw credentials.
+ */
+interface Shared {
+  snapshot: Snapshot | null
+  failure: Failure | null
+  /** Last request attempt by any instance (epoch ms). */
+  lastAttemptAt: number
+  /** No instance sends a request before this time (epoch ms). */
+  blockedUntil: number
+  /** Consecutive 429s, for exponential backoff. */
+  rateLimitStreak: number
+}
 
 export default Plugin.define({
   id: "claude-usage",
   setup(context) {
     const options = readOptions(context.options)
+    const intervalMs = options.intervalSeconds * 1000
+
+    const [shared, update] = context.storage.store<Shared>("usage", {
+      initial: { snapshot: null, failure: null, lastAttemptAt: 0, blockedUntil: 0, rateLimitStreak: 0 },
+    })
 
     // Plugin-owned reactive state (signals, memo, polling effect). No host UI APIs are called in here.
     const state = createRoot((dispose) => {
-      const [result, setResult] = createSignal<UsageResult | undefined>()
-      const [loading, setLoading] = createSignal(false)
       const [now, setNow] = createSignal(Date.now())
-      const [lastError, setLastError] = createSignal<string | undefined>()
+      const [loading, setLoading] = createSignal(false)
       // Number of mounted sidebar slots. The host mounts sidebar.content only while the sidebar is visible.
       const [sidebarMounts, setSidebarMounts] = createSignal(0)
 
@@ -37,70 +74,97 @@ export default Plugin.define({
         return providerID !== undefined && options.providers.includes(providerID)
       })
 
-      let lastAttempt = 0
-      let blockedUntil = 0
       let inFlight: Promise<void> | undefined
 
-      const refresh = (force = false): Promise<void> => {
+      /** Sends a request only if no instance has tried within minGapMs and no rate-limit backoff is in effect. */
+      const refresh = (minGapMs: number): Promise<void> => {
         if (inFlight) return inFlight
-        const t = Date.now()
-        if (t < blockedUntil) return Promise.resolve()
-        if (!force && t - lastAttempt < MIN_GAP_MS) return Promise.resolve()
-        lastAttempt = t
+        const start = Date.now()
+        if (start < shared.blockedUntil) return Promise.resolve()
+        if (start - shared.lastAttemptAt < minGapMs) return Promise.resolve()
         setLoading(true)
-        inFlight = fetchUsage()
-          .then((next) => {
-            if (next.status === "rate_limited") blockedUntil = Date.now() + next.retryAfterMs
-            // Keep the last good numbers visible through transient failures; surface the error alongside.
-            setResult((prev) => (next.status === "ok" || prev?.status !== "ok" ? next : prev))
-            if (next.status !== "ok") setLastError(next.message)
-            else setLastError(undefined)
+        inFlight = (async () => {
+          // Claim the attempt first so other instances skip this cycle.
+          await update((draft) => {
+            draft.lastAttemptAt = start
           })
-          .finally(() => {
-            setLoading(false)
-            setNow(Date.now())
-            inFlight = undefined
+          const result = await fetchUsage()
+          const done = Date.now()
+          await update((draft) => {
+            if (result.status === "ok") {
+              draft.snapshot = {
+                windows: result.windows.map((w) => ({ ...w })),
+                extra: result.extra ? { ...result.extra } : null,
+                fetchedAt: result.fetchedAt,
+              }
+              draft.failure = null
+              draft.blockedUntil = 0
+              draft.rateLimitStreak = 0
+              return
+            }
+            draft.failure = { status: result.status, message: result.message, at: done }
+            if (result.status === "rate_limited") {
+              draft.rateLimitStreak += 1
+              const base = Math.max(result.retryAfterMs ?? RATE_LIMIT_BASE_MS, RATE_LIMIT_BASE_MS)
+              draft.blockedUntil = done + Math.min(base * 2 ** (draft.rateLimitStreak - 1), RATE_LIMIT_MAX_MS)
+            }
           })
+        })().finally(() => {
+          setLoading(false)
+          setNow(Date.now())
+          inFlight = undefined
+        })
         return inFlight
       }
 
-      // Poll only while a Claude Agent model is selected.
+      // While a Claude Agent model is selected: refresh if the shared snapshot is older than the interval,
+      // then check every tick. A plugin reload or a second TUI reuses the shared snapshot instead of fetching.
       createEffect(
         on(active, (isActive) => {
           if (!isActive) return
-          void refresh(true)
-          const poll = setInterval(() => void refresh(), options.intervalSeconds * 1000)
-          const tick = setInterval(() => setNow(Date.now()), 30_000)
-          onCleanup(() => {
-            clearInterval(poll)
-            clearInterval(tick)
-          })
+          void refresh(intervalMs)
+          const tick = setInterval(() => {
+            setNow(Date.now())
+            void refresh(intervalMs - TICK_SLACK_MS)
+          }, TICK_MS)
+          onCleanup(() => clearInterval(tick))
         }),
       )
 
-      // Refresh shortly after each completed turn.
+      // Refresh shortly after a completed turn, at most once per ON_DEMAND_GAP_MS across all instances.
       let afterTurn: ReturnType<typeof setTimeout> | undefined
       const stopEvents = context.data.on("session.execution.succeeded", () => {
         if (!active()) return
         clearTimeout(afterTurn)
-        afterTurn = setTimeout(() => void refresh(), AFTER_TURN_DELAY_MS)
+        afterTurn = setTimeout(() => void refresh(ON_DEMAND_GAP_MS), AFTER_TURN_DELAY_MS)
       })
 
-      const view: ViewProps = { result, loading, lastError, now, options }
-      const cleanup = () => {
-        clearTimeout(afterTurn)
-        stopEvents()
-        dispose()
+      const view: ViewProps = {
+        snapshot: () => shared.snapshot,
+        failure: () => {
+          const failure = shared.failure
+          const snapshot = shared.snapshot
+          // A failure older than the current snapshot has already been resolved.
+          return failure && (!snapshot || failure.at > snapshot.fetchedAt) ? failure : null
+        },
+        blockedUntil: () => shared.blockedUntil,
+        loading,
+        now,
+        options,
       }
+
       return {
         active,
         refresh,
         view,
-        details: () => describe(result(), lastError()),
         sidebarVisible: () => sidebarMounts() > 0,
         sidebarMounted: () => setSidebarMounts((n) => n + 1),
         sidebarUnmounted: () => setSidebarMounts((n) => Math.max(0, n - 1)),
-        cleanup,
+        cleanup: () => {
+          clearTimeout(afterTurn)
+          stopEvents()
+          dispose()
+        },
       }
     })
 
@@ -153,8 +217,8 @@ export default Plugin.define({
               })
               return
             }
-            await state.refresh(true)
-            await context.ui.dialog.alert({ title: "Claude plan usage", message: state.details() })
+            await state.refresh(ON_DEMAND_GAP_MS)
+            await context.ui.dialog.alert({ title: "Claude plan usage", message: describe(state.view, Date.now()) })
           },
         },
       ],
@@ -170,33 +234,32 @@ export default Plugin.define({
 })
 
 interface ViewProps {
-  readonly result: () => UsageResult | undefined
+  readonly snapshot: () => Snapshot | null
+  readonly failure: () => Failure | null
+  readonly blockedUntil: () => number
   readonly loading: () => boolean
-  readonly lastError: () => string | undefined
   readonly now: () => number
   readonly options: Options
 }
 
 function Sidebar(props: ViewProps) {
   const { theme } = usePlugin()
-  const ok = () => {
-    const r = props.result()
-    return r?.status === "ok" ? r : undefined
-  }
   return (
     <box flexDirection="column" paddingTop={1}>
       <text fg={theme.text.base}>
         <b>Claude plan</b>
       </text>
       <Show
-        when={ok()}
+        when={props.snapshot()}
         fallback={
-          <text fg={theme.text.muted}>{props.loading() ? "loading…" : (props.lastError() ?? "no data yet")}</text>
+          <text fg={theme.text.muted}>
+            {props.failure() ? failureText(props.failure()!, props.blockedUntil()) : props.loading() ? "loading…" : "no data yet"}
+          </text>
         }
       >
-        {(r) => (
+        {(snapshot) => (
           <>
-            <For each={r().windows}>
+            <For each={snapshot().windows}>
               {(w) => (
                 <box flexDirection="row" gap={1}>
                   <text fg={theme.text.muted}>{w.label.padEnd(9)}</text>
@@ -207,16 +270,14 @@ function Sidebar(props: ViewProps) {
                 </box>
               )}
             </For>
-            <Show when={r().extra?.enabled}>
-              <text fg={theme.text.muted}>
-                extra usage on · {formatMoney(r().extra!.usedCredits, r().extra!.currency)} used
-                {r().extra!.monthlyLimit !== null
-                  ? ` / ${formatMoney(r().extra!.monthlyLimit!, r().extra!.currency)}`
-                  : ""}
-              </text>
+            <Show when={snapshot().extra?.enabled}>
+              <text fg={theme.text.muted}>{extraText(snapshot().extra!)}</text>
             </Show>
-            <Show when={props.lastError()}>
-              <text fg={theme.text.feedback.warning.base}>{props.lastError()}</text>
+            <text fg={theme.text.faint}>updated {formatAge(snapshot().fetchedAt, props.now())}</text>
+            <Show when={props.failure()}>
+              {(failure) => (
+                <text fg={theme.text.feedback.warning.base}>{failureText(failure(), props.blockedUntil())}</text>
+              )}
             </Show>
           </>
         )}
@@ -229,31 +290,34 @@ function Footer(props: ViewProps) {
   const { theme } = usePlugin()
   return (
     <Show
-      when={props.result()?.status === "ok"}
-      fallback={<text fg={theme.text.muted}>claude {props.result()?.status === "stale" ? "stale" : "…"}</text>}
+      when={props.snapshot()}
+      fallback={<text fg={theme.text.muted}>claude {props.failure()?.status === "stale" ? "stale" : "…"}</text>}
     >
-      <box flexDirection="row" gap={1}>
-        <For each={(props.result() as Extract<UsageResult, { status: "ok" }>).windows.filter(isPrimary)}>
-          {(w) => (
-            <text fg={levelColor(theme, w.utilization, props.options)}>
-              {w.label} {formatPct(w.utilization)}
-            </text>
-          )}
-        </For>
-      </box>
+      {(snapshot) => (
+        <box flexDirection="row" gap={1}>
+          <For each={snapshot().windows.filter(isPrimary)}>
+            {(w) => (
+              <text fg={levelColor(theme, w.utilization, props.options)}>
+                {w.label} {formatPct(w.utilization)}
+              </text>
+            )}
+          </For>
+        </box>
+      )}
     </Show>
   )
 }
 
-function describe(result: UsageResult | undefined, lastError: string | undefined): string {
-  if (!result) return lastError ?? "No data yet."
-  if (result.status !== "ok") return result.message
-  const now = Date.now()
-  const lines = result.windows.map(
-    (w) => `${w.label.padEnd(9)} ${bar(w.utilization)} ${formatPct(w.utilization).padStart(4)}  ${formatReset(w.resetsAt, now)}`,
+function describe(view: ViewProps, now: number): string {
+  const snapshot = view.snapshot()
+  const failure = view.failure()
+  if (!snapshot) return failure ? failureText(failure, view.blockedUntil()) : "No data yet."
+  const lines = snapshot.windows.map(
+    (w) =>
+      `${w.label.padEnd(9)} ${bar(w.utilization)} ${formatPct(w.utilization).padStart(4)}  ${formatReset(w.resetsAt, now)}`,
   )
-  if (result.extra) {
-    const e = result.extra
+  if (snapshot.extra) {
+    const e = snapshot.extra
     lines.push(
       "",
       `Extra usage: ${e.enabled ? "enabled" : "disabled"}`,
@@ -261,9 +325,21 @@ function describe(result: UsageResult | undefined, lastError: string | undefined
     )
     if (e.spendLimitReached) lines.push("  spend limit reached")
   }
-  if (lastError) lines.push("", `Last refresh failed: ${lastError}`)
-  lines.push("", `Updated ${result.fetchedAt.toLocaleTimeString()}`)
+  lines.push("", `Updated ${new Date(snapshot.fetchedAt).toLocaleTimeString()} (${formatAge(snapshot.fetchedAt, now)})`)
+  if (failure) lines.push(`Last refresh: ${failureText(failure, view.blockedUntil())}`)
   return lines.join("\n")
+}
+
+function failureText(failure: Failure, blockedUntil: number): string {
+  if (failure.status === "rate_limited" && blockedUntil > Date.now()) {
+    return `rate limited · retry ${new Date(blockedUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+  }
+  return failure.message
+}
+
+function extraText(extra: ExtraUsage): string {
+  const limit = extra.monthlyLimit !== null ? ` / ${formatMoney(extra.monthlyLimit, extra.currency)}` : ""
+  return `extra usage on · ${formatMoney(extra.usedCredits, extra.currency)} used${limit}`
 }
 
 function isPrimary(w: UsageWindow): boolean {
@@ -277,22 +353,32 @@ function levelColor(theme: ReturnType<typeof usePlugin>["theme"], pct: number, o
 }
 
 function bar(pct: number): string {
-  const filled = Math.round((Math.min(Math.max(pct, 0), 100) / 100) * BAR_WIDTH)
-  return "█".repeat(filled) + "░".repeat(BAR_WIDTH - filled)
+  const width = 10
+  const filled = Math.round((Math.min(Math.max(pct, 0), 100) / 100) * width)
+  return "█".repeat(filled) + "░".repeat(width - filled)
 }
 
 function formatPct(pct: number): string {
   return `${Math.round(pct)}%`
 }
 
-function formatReset(at: Date, now: number): string {
-  const ms = at.getTime() - now
+function formatReset(at: number, now: number): string {
+  const ms = at - now
   if (ms <= 0) return "resetting"
   const minutes = Math.round(ms / 60_000)
   if (minutes < 60) return `${minutes}m`
   const hours = Math.floor(minutes / 60)
   if (hours < 24) return `${hours}h${String(minutes % 60).padStart(2, "0")}m`
   return `${Math.floor(hours / 24)}d${hours % 24}h`
+}
+
+function formatAge(at: number, now: number): string {
+  const minutes = Math.floor(Math.max(0, now - at) / 60_000)
+  if (minutes < 1) return "just now"
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.floor(hours / 24)}d ago`
 }
 
 function formatMoney(amount: number, currency: string): string {
