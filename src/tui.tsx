@@ -25,7 +25,14 @@ const ON_DEMAND_GAP_MS = 60_000
 const RATE_LIMIT_BASE_MS = 60_000
 const RATE_LIMIT_MAX_MS = 15 * 60_000
 
+/**
+ * Bumped when the meaning of persisted snapshot fields changes. Snapshots with another version are discarded.
+ * 2: extra-usage amounts are stored in major currency units (0.1.1 and earlier stored raw minor units).
+ */
+const SNAPSHOT_VERSION = 2
+
 interface Snapshot {
+  readonly version: number
   readonly windows: UsageWindow[]
   readonly extra: ExtraUsage | null
   readonly fetchedAt: number
@@ -62,6 +69,17 @@ export default Plugin.define({
       initial: { snapshot: null, failure: null, lastAttemptAt: 0, blockedUntil: 0, rateLimitStreak: 0 },
     })
 
+    // Drop a snapshot persisted by an older version (e.g. unscaled extra-usage amounts) and allow an
+    // immediate refetch instead of showing wrong values until the next interval.
+    const currentSnapshot = (): Snapshot | null =>
+      shared.snapshot?.version === SNAPSHOT_VERSION ? shared.snapshot : null
+    if (shared.snapshot && !currentSnapshot()) {
+      void update((draft) => {
+        draft.snapshot = null
+        draft.lastAttemptAt = 0
+      })
+    }
+
     // Plugin-owned reactive state (signals, memo, polling effect). No host UI APIs are called in here.
     const state = createRoot((dispose) => {
       const [now, setNow] = createSignal(Date.now())
@@ -93,6 +111,7 @@ export default Plugin.define({
           await update((draft) => {
             if (result.status === "ok") {
               draft.snapshot = {
+                version: SNAPSHOT_VERSION,
                 windows: result.windows.map((w) => ({ ...w })),
                 extra: result.extra ? { ...result.extra } : null,
                 fetchedAt: result.fetchedAt,
@@ -140,10 +159,10 @@ export default Plugin.define({
       })
 
       const view: ViewProps = {
-        snapshot: () => shared.snapshot,
+        snapshot: currentSnapshot,
         failure: () => {
           const failure = shared.failure
-          const snapshot = shared.snapshot
+          const snapshot = currentSnapshot()
           // A failure older than the current snapshot has already been resolved.
           return failure && (!snapshot || failure.at > snapshot.fetchedAt) ? failure : null
         },

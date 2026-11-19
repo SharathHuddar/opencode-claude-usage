@@ -28,7 +28,9 @@ export interface UsageWindow {
 
 export interface ExtraUsage {
   readonly enabled: boolean
+  /** In major currency units (e.g. dollars), already scaled from the endpoint's minor units. */
   readonly usedCredits: number
+  /** In major currency units (e.g. dollars), already scaled from the endpoint's minor units. */
   readonly monthlyLimit: number | null
   readonly currency: string
   readonly spendLimitReached: boolean
@@ -102,10 +104,12 @@ export function parseUsage(body: unknown, now = Date.now()): Extract<UsageResult
     if (!isRecord(rawExtra) || typeof rawExtra.is_enabled !== "boolean") {
       problems.push("extra_usage.is_enabled is not a boolean")
     } else {
+      // Amounts arrive in minor units (e.g. cents); decimal_places gives the scale.
+      const scale = 10 ** decimalPlaces(rawExtra.decimal_places)
       extra = {
         enabled: rawExtra.is_enabled,
-        usedCredits: typeof rawExtra.used_credits === "number" ? rawExtra.used_credits : 0,
-        monthlyLimit: typeof rawExtra.monthly_limit === "number" ? rawExtra.monthly_limit : null,
+        usedCredits: isFiniteNumber(rawExtra.used_credits) ? rawExtra.used_credits / scale : 0,
+        monthlyLimit: isFiniteNumber(rawExtra.monthly_limit) ? rawExtra.monthly_limit / scale : null,
         currency: typeof rawExtra.currency === "string" ? rawExtra.currency : "USD",
         spendLimitReached: rawExtra.spend_limit_reached === true,
       }
@@ -212,6 +216,20 @@ async function readCredentials(): Promise<Credentials> {
   }
   if (typeof oauth.expiresAt !== "number") throw new Error("keychain credentials missing expiresAt")
   return { accessToken: oauth.accessToken, expiresAt: oauth.expiresAt }
+}
+
+/** Minor-unit scale for extra_usage amounts. Defaults to 2 (cents) when absent or not a sane integer. */
+const DEFAULT_DECIMAL_PLACES = 2
+const MAX_DECIMAL_PLACES = 8
+
+function decimalPlaces(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= MAX_DECIMAL_PLACES
+    ? value
+    : DEFAULT_DECIMAL_PLACES
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
