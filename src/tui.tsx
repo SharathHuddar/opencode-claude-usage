@@ -381,7 +381,8 @@ function formatPct(pct: number): string {
   return `${Math.round(pct)}%`
 }
 
-function formatReset(at: number, now: number): string {
+function formatReset(at: number | null, now: number): string {
+  if (at === null) return "idle"
   const ms = at - now
   if (ms <= 0) return "resetting"
   const minutes = Math.round(ms / 60_000)

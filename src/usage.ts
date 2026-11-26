@@ -22,8 +22,8 @@ export interface UsageWindow {
   readonly label: string
   /** 0-100 */
   readonly utilization: number
-  /** Epoch ms. */
-  readonly resetsAt: number
+  /** Epoch ms, or null when the window has not started (no usage yet, endpoint returns resets_at: null). */
+  readonly resetsAt: number | null
 }
 
 export interface ExtraUsage {
@@ -86,7 +86,13 @@ export function parseUsage(body: unknown, now = Date.now()): Extract<UsageResult
       continue
     }
     const utilization = raw.utilization
-    const resetsAt = typeof raw.resets_at === "string" ? Date.parse(raw.resets_at) : Number.NaN
+    // resets_at is null while a window is idle (no usage since the last reset).
+    const resetsAt =
+      raw.resets_at === null || raw.resets_at === undefined
+        ? null
+        : typeof raw.resets_at === "string"
+          ? Date.parse(raw.resets_at)
+          : Number.NaN
     if (typeof utilization !== "number" || !Number.isFinite(utilization)) {
       problems.push(`${spec.key}.utilization is not a number`)
       continue
